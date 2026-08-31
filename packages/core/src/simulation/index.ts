@@ -1,0 +1,1324 @@
+import fs from "fs"
+import path from "path"
+import assert from "assert"
+import zlib from "zlib"
+import readline from "readline"
+import { buildSync } from "esbuild"
+import { Worker, isMainThread, parentPort, workerData } from "worker_threads"
+import {
+  createGameConfig,
+  GameConfigOptions,
+  GameConfig,
+  GameMetadata,
+} from "../game-config"
+import { createGameContext, GameContext } from "../game-context"
+import { createDirIfNotExists, round, writeFile } from "../../utils"
+import { SPIN_TYPE } from "../constants"
+import { Book } from "../book"
+import { Tagger, TagItem } from "../tagger"
+import { Wallet } from "../wallet"
+import { ResultSet } from "../result-set"
+import { pipeline } from "stream/promises"
+import { createCriteriaSampler, hashStringToInt, splitCountsAcrossChunks } from "./utils"
+import { io, Socket } from "socket.io-client"
+import chalk from "chalk"
+import {
+  createPermanentFilePaths,
+  createTemporaryFilePaths,
+  FilePaths,
+} from "../utils/file-paths"
+import { TerminalUi } from "../tui"
+import { Readable } from "stream"
+
+let completedSimulations = 0
+const TEMP_FILENAME = "__temp_compiled_src_IGNORE.js"
+const TEMP_FOLDER = "temp_files"
+
+/**
+ * Class for handling simulations of the slot game.
+ *
+ * High level overview:
+ * - Main thread compiles user code to JS and spawns workers
+ * - Workers run compiled code to execute simulations
+ * - Workers send data to main thread
+ * - Main thread merges data and writes files
+ *
+ * Notes:
+ * - Backpressure system with credits to avoid overwhelming the main thread
+ * - Limited amount of credits
+ * - Worker uses credit to return data to main thread
+ * - After writing data, main thread gives worker new credit
+ * - Prevents workers sending more data than the main thread can write in time
+ */
+export class Simulation {
+  readonly gameConfigOpts: GameConfigOptions
+  readonly gameConfig: GameConfig & GameMetadata
+  readonly simRunsAmount: Partial<Record<string, number>>
+  readonly concurrency: number
+  readonly makeUncompressedBooks: boolean
+  private debug = false
+  private actualSims = 0
+  private wallet: Wallet = new Wallet()
+  private summary: SimulationSummary = {}
+  private tagsWriteStream: fs.WriteStream | undefined
+  private hasWrittenTag = false
+  private readonly streamHighWaterMark = 500 * 1024 * 1024
+  private readonly maxPendingSims: number
+  private readonly maxHighWaterMark: number
+  private panelPort: number = 7770
+  private panelActive: boolean = false
+  private panelWsUrl: string | undefined
+  private socket: Socket | undefined
+  private tui: TerminalUi | undefined
+  private tempBookIndexPaths: string[] = []
+  private bookIndexMetas: Array<{
+    worker: number
+    chunks: number
+    simStart: number
+    simEnd: number
+  }> = []
+
+  PATHS = {} as FilePaths
+
+  // Worker related
+  private credits = 0
+  private creditWaiters: Array<() => void> = []
+  private creditListenerInit = false
+  private bookBuffers = new Map<number, string[]>()
+  private bookBufferSizes = new Map<number, number>()
+  private bookChunkIndexes = new Map<number, number>()
+  private workerCtx: GameContext | undefined
+  private userStateJson: string | undefined
+
+  constructor(opts: SimulationOptions, gameConfigOpts: GameConfigOptions) {
+    const { config, metadata } = createGameConfig(gameConfigOpts)
+    this.gameConfig = { ...config, ...metadata }
+    this.gameConfigOpts = gameConfigOpts
+    this.makeUncompressedBooks = opts.makeUncompressedBooks || false
+    this.simRunsAmount = opts.simRunsAmount || {}
+    this.concurrency = (opts.concurrency || 6) >= 2 ? opts.concurrency || 6 : 2
+    this.maxPendingSims = opts.maxPendingSims ?? 25
+    this.maxHighWaterMark = (opts.maxDiskBuffer ?? 150) * 1024 * 1024
+
+    const gameModeKeys = Object.keys(this.gameConfig.gameModes)
+    assert(
+      Object.values(this.gameConfig.gameModes)
+        .map((m) => gameModeKeys.includes(m.name))
+        .every((v) => v === true),
+      "Game mode name must match its key in the gameModes object.",
+    )
+
+    const basePath = path.join(this.gameConfig.rootDir, this.gameConfig.outputDir)
+
+    this.PATHS = {
+      ...createPermanentFilePaths(basePath),
+      ...createTemporaryFilePaths(basePath, TEMP_FOLDER),
+    }
+
+    this.tui = new TerminalUi({
+      gameMode: "N/A",
+    })
+  }
+
+  async runSimulation(opts: SimulationConfigOptions) {
+    const debug = opts.debug || false
+    this.debug = debug
+    let statusMessage = ""
+
+    const gameModesToSimulate = Object.keys(this.simRunsAmount)
+    const configuredGameModes = Object.keys(this.gameConfig.gameModes)
+
+    if (gameModesToSimulate.length === 0) {
+      throw new Error("No game modes configured for simulation.")
+    }
+
+    this.generateReelsetFiles()
+
+    // Code that runs when the user executes the simulations.
+    // This spawns individual processes and merges the results afterwards.
+    if (isMainThread) {
+      this.preprocessFiles()
+
+      // Workers can use websocket to send data to panel if configured
+      this.panelPort = opts.panelPort || 7770
+      this.panelWsUrl = `http://localhost:${this.panelPort}`
+
+      await new Promise<void>((resolve) => {
+        try {
+          this.socket = io(this.panelWsUrl, {
+            path: "/ws",
+            transports: ["websocket", "polling"],
+            withCredentials: true,
+            autoConnect: false,
+            reconnection: false,
+          })
+          this.socket.connect()
+          this.socket.once("connect", () => {
+            this.panelActive = true
+            resolve()
+          })
+          this.socket.once("connect_error", () => {
+            this.socket?.close()
+            this.socket = undefined
+            resolve()
+          })
+        } catch (error) {
+          this.socket = undefined
+          resolve()
+        }
+      })
+
+      this.tui?.start()
+
+      fs.rmSync(path.join(this.PATHS.base, "books_chunks"), {
+        recursive: true,
+        force: true,
+      })
+
+      for (const mode of gameModesToSimulate) {
+        completedSimulations = 0
+        this.wallet = new Wallet()
+        this.tui?.setDetails({
+          gameMode: mode,
+          totalSims: this.simRunsAmount[mode] || 0,
+        })
+        this.hasWrittenTag = false
+        this.bookIndexMetas = []
+        this.tempBookIndexPaths = []
+        this.bookChunkIndexes = new Map()
+        this.bookBuffers = new Map()
+        this.bookBufferSizes = new Map()
+
+        const startTime = Date.now()
+        statusMessage = `Simulating mode "${mode}" with ${this.simRunsAmount[mode]} runs.`
+        this.tui?.log(statusMessage)
+        this.sendSimulationStatus(statusMessage)
+
+        const runs = this.simRunsAmount[mode] || 0
+        if (runs <= 0) continue
+
+        if (!configuredGameModes.includes(mode)) {
+          throw new Error(
+            `Tried to simulate game mode "${mode}", but it's not configured in the game config.`,
+          )
+        }
+
+        this.summary[mode] = {
+          total: { numSims: runs, bsWins: 0, fsWins: 0, rtp: 0 },
+          criteria: {},
+        }
+
+        const tempTagsPath = this.PATHS.tempTags(mode)
+
+        createDirIfNotExists(this.PATHS.base)
+        createDirIfNotExists(path.join(this.PATHS.base, TEMP_FOLDER))
+
+        this.tagsWriteStream = fs
+          .createWriteStream(tempTagsPath, {
+            highWaterMark: this.maxHighWaterMark,
+          })
+          .setMaxListeners(30)
+
+        const criteriaCounts = ResultSet.getNumberOfSimsForCriteria(this, mode)
+        const totalSims = Object.values(criteriaCounts).reduce((a, b) => a + b, 0)
+        assert(
+          totalSims === runs,
+          `Criteria mismatch for mode "${mode}". Expected ${runs}, got ${totalSims}`,
+        )
+
+        const chunks = this.getSimRangesForChunks(totalSims, this.concurrency!)
+        const chunkSizes = chunks.map(([s, e]) => Math.max(0, e - s + 1))
+        const chunkCriteriaCounts = splitCountsAcrossChunks(criteriaCounts, chunkSizes)
+
+        await this.spawnWorkersForGameMode({
+          mode,
+          chunks,
+          chunkCriteriaCounts,
+          totalSims,
+        })
+
+        createDirIfNotExists(this.PATHS.publishFiles)
+
+        statusMessage = `Writing final files for game mode "${mode}". This may take a while...`
+        this.tui?.log(statusMessage)
+        this.sendSimulationStatus(statusMessage)
+
+        writeFile(
+          this.PATHS.booksIndexMeta(mode),
+          JSON.stringify(
+            this.bookIndexMetas.sort((a, b) => a.worker - b.worker),
+            null,
+            2,
+          ),
+        )
+
+        // Merge temporary book files into the final sorted file.
+        const booksPath = this.PATHS.booksCompressed(mode)
+
+        try {
+          const finalBookStream = fs.createWriteStream(booksPath, {
+            highWaterMark: this.streamHighWaterMark,
+          })
+
+          for (const { worker, chunks } of this.bookIndexMetas) {
+            for (let chunk = 0; chunk < chunks; chunk++) {
+              const bookChunkPath = this.PATHS.booksChunk(mode, worker, chunk)
+              if (!fs.existsSync(bookChunkPath)) continue
+              const chunkData = fs.readFileSync(bookChunkPath)
+              if (!finalBookStream.write(chunkData)) {
+                await new Promise<void>((r) => finalBookStream.once("drain", () => r()))
+              }
+            }
+          }
+
+          finalBookStream.end()
+          await new Promise<void>((r) => finalBookStream.on("finish", () => r()))
+        } catch (error) {
+          throw new Error(`Error merging book files: ${(error as Error).message}`)
+        }
+
+        // Merge temporary LUTs
+        const lutPath = this.PATHS.lookupTable(mode)
+        const lutPathPublish = this.PATHS.lookupTablePublish(mode)
+        const lutSegmentedPath = this.PATHS.lookupTableSegmented(mode)
+
+        await this.mergeCsv(
+          chunks,
+          lutPath,
+          (i) => `temp_lookup_${mode}_${i}.csv`,
+          this.PATHS.lookupTableIndex(mode),
+        )
+        fs.copyFileSync(lutPath, lutPathPublish)
+        await this.mergeCsv(
+          chunks,
+          lutSegmentedPath,
+          (i) => `temp_lookup_segmented_${mode}_${i}.csv`,
+          this.PATHS.lookupTableSegmentedIndex(mode),
+        )
+
+        if (this.tagsWriteStream) {
+          await new Promise<void>((resolve) => {
+            this.tagsWriteStream!.end(() => {
+              resolve()
+            })
+          })
+          this.tagsWriteStream = undefined
+        }
+
+        await this.writeTags(mode)
+        this.writeIndexJson()
+
+        if (this.makeUncompressedBooks) {
+          statusMessage = `Creating decompressed book file for mode "${mode}". This may take a while...`
+          this.tui?.log(statusMessage)
+          this.sendSimulationStatus(statusMessage)
+
+          const uncompressedBooksPath = this.PATHS.booksUncompressed(mode)
+          const outputStream = fs.createWriteStream(uncompressedBooksPath, {
+            highWaterMark: this.streamHighWaterMark,
+          })
+
+          try {
+            // Decompress each chunk instead of final file. Node doesn't handle multiple zstd frames
+            for (const { worker, chunks } of this.bookIndexMetas) {
+              for (let chunk = 0; chunk < chunks; chunk++) {
+                const bookChunkPath = this.PATHS.booksChunk(mode, worker, chunk)
+                if (!fs.existsSync(bookChunkPath)) continue
+
+                const inputStream = fs.createReadStream(bookChunkPath)
+                const compress = zlib.createZstdDecompress()
+
+                for await (const decompChunk of inputStream.pipe(compress)) {
+                  if (!outputStream.write(decompChunk)) {
+                    await new Promise<void>((r) => outputStream.once("drain", () => r()))
+                  }
+                }
+              }
+            }
+
+            outputStream.end()
+            await new Promise<void>((r) => outputStream.on("finish", () => r()))
+          } catch (error) {
+            statusMessage = chalk.yellow(
+              `Error creating uncompressed book file: ${(error as Error).message}`,
+            )
+            this.tui?.log(statusMessage)
+            this.sendSimulationStatus(statusMessage)
+          }
+        }
+
+        if (this.gameConfig.hooks.onGameModeComplete) {
+          statusMessage = `Running onGameModeComplete hook for mode "${mode}"...`
+          this.tui?.log(statusMessage)
+          this.sendSimulationStatus(statusMessage)
+
+          const { outputDir, rootDir, isCustomRoot, paths } = this.gameConfig
+          await this.gameConfig.hooks.onGameModeComplete({
+            mode,
+            paths,
+            metadata: { outputDir, rootDir, isCustomRoot, paths },
+          })
+        }
+
+        const endTime = Date.now()
+        const prettyTime = new Date(endTime - startTime).toISOString().slice(11, -1)
+
+        statusMessage = `Mode ${mode} done! Time taken: ${prettyTime}`
+        this.tui?.log(statusMessage)
+        this.sendSimulationStatus(statusMessage)
+      }
+
+      this.tui?.stop()
+
+      await this.printSimulationSummary()
+    }
+
+    let desiredSims = 0
+    let actualSims = 0
+    const criteriaToRetries: Record<string, number> = {}
+
+    // Code that runs for individual processes
+    if (!isMainThread) {
+      const { mode, simStart, simEnd, index, criteriaCounts } = workerData as {
+        mode: string
+        simStart: number
+        simEnd: number
+        index: number
+        criteriaCounts: Record<string, number>
+      }
+
+      const seed = (hashStringToInt(mode) + index) >>> 0
+      const nextCriteria = createCriteriaSampler(criteriaCounts, seed)
+
+      // Run each simulation until the criteria is met.
+      for (let simId = simStart; simId <= simEnd; simId++) {
+        if (this.debug) desiredSims++
+
+        const criteria = nextCriteria()
+
+        if (!criteriaToRetries[criteria]) criteriaToRetries[criteria] = 0
+
+        await this.acquireCredit()
+
+        this.runSingleSimulation({ simId, mode, criteria, index })
+
+        if (this.debug) {
+          criteriaToRetries[criteria] += this.actualSims - 1
+          actualSims += this.actualSims
+        }
+      }
+
+      // TODO: Reimplement better, later
+      /* if (this.debug) {
+        console.log(`Desired ${desiredSims}, Actual ${actualSims}`)
+        console.log(`Retries per criteria:`, criteriaToRetries)
+      } */
+
+      parentPort?.postMessage({
+        type: "done",
+        workerNum: index,
+      })
+
+      parentPort?.removeAllListeners()
+      parentPort?.close()
+    }
+
+    if (this.socket && this.panelActive) {
+      // Wait a bit for the simulationSummary event to be sent first
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      this.socket?.close()
+    }
+  }
+
+  /**
+   * Runs all simulations for a specific game mode.
+   */
+  async spawnWorkersForGameMode(opts: {
+    mode: string
+    chunks: [number, number][]
+    chunkCriteriaCounts: Array<Record<string, number>>
+    totalSims: number
+  }) {
+    const { mode, chunks, chunkCriteriaCounts, totalSims } = opts
+
+    try {
+      await Promise.all(
+        chunks.map(([simStart, simEnd], index) => {
+          return this.callWorker({
+            basePath: this.PATHS.base,
+            mode,
+            simStart,
+            simEnd,
+            index,
+            totalSims,
+            criteriaCounts: chunkCriteriaCounts[index]!,
+          })
+        }),
+      )
+    } catch (error) {
+      this.tui?.stop()
+      throw error
+    }
+  }
+
+  async callWorker(opts: {
+    basePath: string
+    mode: string
+    simStart: number
+    simEnd: number
+    index: number
+    totalSims: number
+    criteriaCounts: Record<string, number>
+  }) {
+    const { mode, simEnd, simStart, basePath, index, totalSims, criteriaCounts } = opts
+
+    const write = async (stream: fs.WriteStream, chunk: string) => {
+      if (!stream.write(chunk)) {
+        await new Promise<void>((resolve) => stream.once("drain", resolve))
+      }
+    }
+
+    return new Promise((resolve, reject) => {
+      const scriptPath = path.join(basePath, TEMP_FILENAME)
+      createDirIfNotExists(path.join(this.PATHS.base, "books_chunks"))
+
+      const startTime = Date.now()
+
+      const worker = new Worker(scriptPath, {
+        workerData: {
+          mode,
+          simStart,
+          simEnd,
+          index,
+          criteriaCounts,
+        },
+      })
+
+      worker.postMessage({ type: "credit", amount: this.maxPendingSims })
+
+      const flushBookChunk = async () => {
+        if (this.bookBuffers.get(index)?.length === 0) return
+
+        if (!this.bookChunkIndexes.has(index)) {
+          this.bookChunkIndexes.set(index, 0)
+        }
+
+        const chunkIndex = this.bookChunkIndexes.get(index)!
+
+        const bookChunkPath = this.PATHS.booksChunk(mode, index, chunkIndex)
+        const bookLines = this.bookBuffers.get(index)!
+
+        await pipeline(
+          Readable.from(bookLines),
+          zlib.createZstdCompress(),
+          fs.createWriteStream(bookChunkPath),
+        )
+
+        this.bookBuffers.set(index, [])
+        this.bookBufferSizes.set(index, 0)
+        this.bookChunkIndexes.set(index, chunkIndex + 1)
+      }
+
+      const booksIndexPath = this.PATHS.booksIndex(mode, index)
+      const booksIndexStream = fs.createWriteStream(booksIndexPath, {
+        highWaterMark: this.maxHighWaterMark,
+      })
+
+      const tempLookupPath = this.PATHS.tempLookupTable(mode, index)
+      const lookupStream = fs.createWriteStream(tempLookupPath, {
+        highWaterMark: this.maxHighWaterMark,
+      })
+
+      const tempLookupSegPath = this.PATHS.tempLookupTableSegmented(mode, index)
+      const lookupSegmentedStream = fs.createWriteStream(tempLookupSegPath, {
+        highWaterMark: this.maxHighWaterMark,
+      })
+
+      const WRITE_BATCH_SIZE = 200
+      let booksIndexBatch: string[] = []
+      let lookupBatch: string[] = []
+      let lookupSegBatch: string[] = []
+
+      const flushWriteBatches = async () => {
+        if (booksIndexBatch.length === 0) return
+        const booksIndexData = booksIndexBatch.join("")
+        const lookupData = lookupBatch.join("")
+        const lookupSegData = lookupSegBatch.join("")
+        booksIndexBatch = []
+        lookupBatch = []
+        lookupSegBatch = []
+        await Promise.all([
+          write(booksIndexStream, booksIndexData),
+          write(lookupStream, lookupData),
+          write(lookupSegmentedStream, lookupSegData),
+        ])
+      }
+
+      let writeChain: Promise<void> = Promise.resolve()
+
+      worker.on("message", (msg) => {
+        if (msg.type === "log" || msg.type === "user-log") {
+          this.tui?.log(msg.message)
+          return
+        }
+
+        if (msg.type === "log-exit") {
+          this.tui?.log(msg.message)
+          this.tui?.stop()
+          console.log(msg.message)
+          process.exit(1)
+        }
+
+        if (msg.type === "complete") {
+          completedSimulations++
+
+          // Moving this out of the writeChain hopefully doesn't cause desync, let's pray
+          if (completedSimulations % 250 === 0 || completedSimulations === totalSims) {
+            const percentage = (completedSimulations / totalSims) * 100
+            this.tui?.setProgress(
+              percentage,
+              this.getTimeRemaining(startTime, totalSims),
+              completedSimulations,
+            )
+          }
+
+          if (this.socket && this.panelActive) {
+            if (completedSimulations % 1000 === 0 || completedSimulations === totalSims) {
+              this.socket.emit("simulationProgress", {
+                mode,
+                percentage: (completedSimulations / totalSims) * 100,
+                current: completedSimulations,
+                total: totalSims,
+                timeRemaining: this.getTimeRemaining(startTime, totalSims),
+              })
+
+              this.socket.emit(
+                "simulationShouldStop",
+                this.gameConfig.id,
+                (shouldStop: boolean) => {
+                  if (shouldStop) {
+                    worker.terminate()
+                  }
+                },
+              )
+            }
+          }
+
+          writeChain = writeChain
+            .then(async () => {
+              const bookId = msg.bookId as number
+              const bookCriteria = msg.bookCriteria as string
+              const bookPayout = msg.bookPayout as number
+              const bookBasegameWins = msg.bookBasegameWins as number
+              const bookFreespinsWins = msg.bookFreespinsWins as number
+              const bookLine = msg.bookLine as string
+              const bookLineWithNewline = bookLine + "\n"
+
+              if (!this.summary[mode]?.criteria[bookCriteria]) {
+                this.summary[mode]!.criteria[bookCriteria] = {
+                  numSims: 0,
+                  bsWins: 0,
+                  fsWins: 0,
+                  rtp: 0,
+                }
+              }
+              const bsWins = round(bookBasegameWins, 4)
+              const fsWins = round(bookFreespinsWins, 4)
+              const criteria = this.summary[mode]!.criteria[bookCriteria]!
+              criteria.numSims += 1
+              this.summary[mode]!.total.bsWins += bsWins
+              this.summary[mode]!.total.fsWins += fsWins
+              criteria.bsWins! += bsWins
+              criteria.fsWins! += fsWins
+              const lineSize = Buffer.byteLength(bookLineWithNewline, "utf8")
+
+              if (this.bookBuffers.has(index)) {
+                this.bookBuffers.get(index)!.push(bookLineWithNewline)
+                this.bookBufferSizes.set(
+                  index,
+                  this.bookBufferSizes.get(index)! + lineSize,
+                )
+              } else {
+                this.bookBuffers.set(index, [bookLineWithNewline])
+                this.bookBufferSizes.set(index, lineSize)
+              }
+
+              if (!this.tempBookIndexPaths.includes(booksIndexPath)) {
+                this.tempBookIndexPaths.push(booksIndexPath)
+              }
+
+              booksIndexBatch.push(
+                `${bookId},${index},${this.bookChunkIndexes.get(index) || 0}\n`,
+              )
+              lookupBatch.push(`${bookId},1,${Math.round(bookPayout)}\n`)
+              lookupSegBatch.push(
+                `${bookId},${bookCriteria},${bookBasegameWins},${bookFreespinsWins}\n`,
+              )
+
+              if (booksIndexBatch.length >= WRITE_BATCH_SIZE) {
+                await flushWriteBatches()
+              }
+
+              if (this.bookBufferSizes.get(index)! >= 10 * 1024 * 1024) {
+                await flushBookChunk()
+              }
+
+              if (
+                this.tagsWriteStream &&
+                typeof msg.tagsLines === "string" &&
+                msg.tagsLines.length
+              ) {
+                const tagPrefix = this.hasWrittenTag ? "\n" : ""
+                await write(this.tagsWriteStream, tagPrefix + msg.tagsLines)
+                this.hasWrittenTag = true
+              }
+
+              this.wallet.mergeSerialized(msg.wallet)
+
+              worker.postMessage({ type: "credit", amount: 1 })
+            })
+            .catch(reject)
+
+          return
+        }
+
+        if (msg.type === "done") {
+          writeChain
+            .then(async () => {
+              await flushWriteBatches()
+              await flushBookChunk()
+              lookupStream.end()
+              lookupSegmentedStream.end()
+              booksIndexStream.end()
+
+              await Promise.all([
+                new Promise<void>((r) => lookupStream.on("finish", () => r())),
+                new Promise<void>((r) => lookupSegmentedStream.on("finish", () => r())),
+                new Promise<void>((r) => booksIndexStream.on("finish", () => r())),
+              ])
+
+              const bookIndexMeta = {
+                worker: index,
+                chunks: this.bookChunkIndexes.get(index)! + 2,
+                simStart,
+                simEnd,
+              }
+              this.bookIndexMetas.push(bookIndexMeta)
+
+              resolve(true)
+            })
+            .catch(reject)
+
+          return
+        }
+      })
+
+      worker.on("error", (error) => {
+        this.tui?.log(error.message)
+        resolve(error)
+      })
+
+      worker.on("exit", (code) => {
+        if (code !== 0) {
+          this.tui?.log(chalk.yellow(`Worker stopped with exit code ${code}`))
+          resolve(false)
+        }
+      })
+    })
+  }
+
+  /**
+   * Will run a single simulation until the specified criteria is met.
+   */
+  runSingleSimulation(opts: {
+    simId: number
+    mode: string
+    criteria: string
+    index: number
+  }) {
+    const { simId, mode, criteria } = opts
+    let retries = 0
+
+    // Reuse a single game context (and its services) per worker.
+    // All mutable state is reset by `resetSimulation` before each attempt.
+    let ctx = this.workerCtx
+    if (!ctx) {
+      ctx = createGameContext({
+        config: this.gameConfig,
+      })
+      ctx.services.data._setBook(
+        new Book({
+          id: simId,
+          criteria,
+        }),
+      )
+      ctx.services.wallet._setWallet(new Wallet())
+      ctx.services.data._setTagger(new Tagger())
+      this.workerCtx = ctx
+    }
+
+    ctx.state.currentGameMode = mode
+    ctx.state.currentSimulationId = simId
+    ctx.state.isCriteriaMet = false
+
+    const resultSet = ctx.services.game.getResultSetByCriteria(
+      ctx.state.currentGameMode,
+      criteria,
+    )
+
+    ctx.state.currentResultSet = resultSet
+
+    while (!ctx.state.isCriteriaMet) {
+      this.actualSims++
+
+      // The first attempt records normally. Retries run as dry runs where book
+      // events and records are skipped for performance.
+      // Successfull attempt is then replayed once with recording enabled,
+      // restoring the RNG to reproduce the same outcome.
+      const isDryRun = retries > 0
+      const rngSnapshot = isDryRun ? ctx.services.rng._getStateSnapshot() : undefined
+
+      this.resetSimulation(ctx)
+      ctx.state.isDryRun = isDryRun
+
+      this.handleGameFlow(ctx)
+
+      if (!ctx.state.skipAttempt && resultSet.meetsCriteria(ctx)) {
+        if (isDryRun) {
+          ctx.services.rng._restoreStateSnapshot(rngSnapshot!)
+          this.resetSimulation(ctx)
+          ctx.state.isDryRun = false
+
+          this.handleGameFlow(ctx)
+
+          // Evaluate again for record side effects of the accepted attempt
+          resultSet.meetsCriteria(ctx)
+        }
+        ctx.state.isCriteriaMet = true
+      }
+
+      retries++
+
+      if (!ctx.state.isCriteriaMet && retries % 10_000 === 0) {
+        parentPort?.postMessage({
+          type: "log",
+          message: chalk.yellow(
+            `Excessive retries @ #${simId} @ criteria "${criteria}": ${retries} retries`,
+          ),
+        })
+      }
+
+      if (!ctx.state.isCriteriaMet && retries % 50_000 === 0) {
+        parentPort?.postMessage({
+          type: "log-exit",
+          message: chalk.red("Possible infinite loop detected, exiting simulation."),
+        })
+      }
+    }
+
+    const wallet = ctx.services.wallet._getWallet()
+    wallet.writePayoutToBook(ctx)
+    wallet.confirmWins(ctx)
+
+    const book = ctx.services.data._getBook()
+    if (book.payout >= ctx.config.maxWinX) {
+      ctx.state.triggeredMaxWin = true
+    }
+
+    ctx.services.data.tag({
+      criteria: resultSet.criteria,
+    })
+
+    ctx.config.hooks.onSimulationAccepted?.(ctx)
+
+    this.confirmTags(ctx)
+
+    // Pre-serialize the book line in the worker to avoid overhead
+    const bookLine = JSON.stringify({
+      id: book.id,
+      payoutMultiplier: book.payout,
+      events: book.events,
+    })
+
+    const tags = ctx.services.data._getTags()
+    const tagsLines = tags.length > 0 ? tags.map((t) => JSON.stringify(t)).join("\n") : ""
+
+    parentPort?.postMessage({
+      type: "complete",
+      simId,
+      bookLine,
+      bookId: book.id,
+      bookCriteria: book.criteria,
+      bookPayout: book.payout,
+      bookBasegameWins: book.basegameWins,
+      bookFreespinsWins: book.freespinsWins,
+      wallet: wallet.serialize(),
+      tagsLines,
+    })
+  }
+
+  private initCreditListener() {
+    if (this.creditListenerInit) return
+    this.creditListenerInit = true
+
+    parentPort?.on("message", (msg: any) => {
+      if (msg?.type !== "credit") return
+      const amount = Number(msg?.amount ?? 0)
+      if (!Number.isFinite(amount) || amount <= 0) return
+
+      this.credits += amount
+
+      while (this.credits > 0 && this.creditWaiters.length > 0) {
+        this.credits -= 1
+        const resolve = this.creditWaiters.shift()!
+        resolve()
+      }
+    })
+  }
+
+  private acquireCredit() {
+    this.initCreditListener()
+
+    if (this.credits > 0) {
+      this.credits -= 1
+      return Promise.resolve()
+    }
+
+    return new Promise<void>((resolve) => {
+      this.creditWaiters.push(resolve)
+    })
+  }
+
+  /**
+   * If a simulation does not meet the required criteria, reset the state to run it again.
+   *
+   * This also runs once before each simulation to ensure a clean state.
+   */
+  protected resetSimulation(ctx: GameContext) {
+    this.resetState(ctx)
+    ctx.services.board.resetBoard()
+    ctx.services.data._getTagger()._reset()
+    ctx.services.wallet._getWallet()._reset()
+    ctx.services.data
+      ._getBook()
+      ._reset(ctx.state.currentSimulationId, ctx.state.currentResultSet.criteria)
+    ctx.services.game.getCurrentGameMode()._resetTempValues()
+  }
+
+  protected resetState(ctx: GameContext) {
+    ctx.services.rng.setSeedIfDifferent(ctx.state.currentSimulationId)
+    ctx.state.currentSpinType = SPIN_TYPE.BASE_GAME
+    ctx.state.currentFreespinAmount = 0
+    ctx.state.totalFreespinAmount = 0
+    ctx.state.triggeredMaxWin = false
+    ctx.state.triggeredFreespins = false
+    ctx.state.skipAttempt = false
+    this.userStateJson ??= JSON.stringify(ctx.config.userState)
+    ctx.state.userData = JSON.parse(this.userStateJson)
+  }
+
+  /**
+   * Contains and executes the entire game logic:
+   * - Drawing the board
+   * - Evaluating wins
+   * - Updating wallet
+   * - Handling free spins
+   * - Tagging events
+   *
+   * You can customize the game flow by implementing the `onHandleGameFlow` hook in the game configuration.
+   */
+  protected handleGameFlow(ctx: GameContext) {
+    this.gameConfig.hooks.onHandleGameFlow(ctx)
+  }
+
+  private async writeTags(mode: string) {
+    const tempTagsPath = this.PATHS.tempTags(mode)
+    const tagsPath = this.PATHS.tags(mode)
+
+    const allSearchKeysAndValues = new Map<string, Set<string>>()
+
+    // Use a local Map to aggregate tags efficiently without cluttering the main Tagger
+    // Key is the stringified search criteria
+    const aggregatedTags = new Map<string, TagItem>()
+
+    if (fs.existsSync(tempTagsPath)) {
+      const fileStream = fs.createReadStream(tempTagsPath, {
+        highWaterMark: this.streamHighWaterMark,
+      })
+
+      const rl = readline.createInterface({
+        input: fileStream,
+        crlfDelay: Infinity,
+      })
+
+      for await (const line of rl) {
+        if (line.trim() === "") continue
+        const tag: TagItem = JSON.parse(line)
+
+        for (const entry of tag.search) {
+          if (!allSearchKeysAndValues.has(entry.name)) {
+            allSearchKeysAndValues.set(entry.name, new Set<string>())
+          }
+          allSearchKeysAndValues.get(entry.name)!.add(String(entry.value))
+        }
+
+        const key = JSON.stringify(tag.search)
+
+        let existing = aggregatedTags.get(key)
+        if (!existing) {
+          existing = {
+            search: tag.search,
+            timesTriggered: 0,
+            bookIds: [],
+          }
+          aggregatedTags.set(key, existing)
+        }
+
+        existing.timesTriggered += tag.timesTriggered
+
+        for (const bookId of tag.bookIds) {
+          existing.bookIds.push(bookId)
+        }
+      }
+    }
+
+    fs.rmSync(tagsPath, { force: true })
+    fs.rmSync(this.PATHS.tagKeys(mode), { force: true })
+
+    const writeStream = fs.createWriteStream(tagsPath, { encoding: "utf-8" })
+    writeStream.write("[\n")
+
+    let isFirst = true
+    for (const tag of aggregatedTags.values()) {
+      if (!isFirst) {
+        writeStream.write(",\n")
+      }
+      writeStream.write(JSON.stringify(tag))
+      isFirst = false
+    }
+
+    writeStream.write("\n]")
+    writeStream.end()
+
+    await new Promise<void>((resolve) => {
+      writeStream.on("finish", () => resolve())
+    })
+
+    const tagKeysJson = Object.fromEntries(
+      Array.from(allSearchKeysAndValues.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, values]) => [key, Array.from(values)]),
+    )
+    writeFile(this.PATHS.tagKeys(mode), JSON.stringify(tagKeysJson, null, 2))
+
+    fs.rmSync(tempTagsPath, { force: true })
+  }
+
+  private writeIndexJson() {
+    const outputFilePath = this.PATHS.indexJson
+
+    const modes = Object.keys(this.simRunsAmount).map((id) => {
+      const mode = this.gameConfig.gameModes[id]
+      assert(mode, `Game mode "${id}" not found in game config.`)
+
+      return {
+        name: mode.name,
+        cost: mode.cost,
+        events: `books_${mode.name}.jsonl.zst`,
+        weights: `lookUpTable_${mode.name}_0.csv`,
+      }
+    })
+
+    writeFile(outputFilePath, JSON.stringify({ modes }, null, 2))
+  }
+
+  /**
+   * Compiles user configured game to JS for use in different Node processes
+   */
+  private preprocessFiles() {
+    const builtFilePath = path.join(
+      this.gameConfig.rootDir,
+      this.gameConfig.outputDir,
+      TEMP_FILENAME,
+    )
+    fs.rmSync(builtFilePath, { force: true })
+    buildSync({
+      entryPoints: [this.gameConfig.rootDir],
+      bundle: true,
+      platform: "node",
+      outfile: path.join(
+        this.gameConfig.rootDir,
+        this.gameConfig.outputDir,
+        TEMP_FILENAME,
+      ),
+      external: ["esbuild", "yargs"],
+    })
+  }
+
+  private getSimRangesForChunks(total: number, chunks: number): [number, number][] {
+    const realChunks = Math.min(chunks, Math.max(total, 1))
+    const base = Math.floor(total / realChunks)
+    const remainder = total % realChunks
+    const result: [number, number][] = []
+
+    let current = 1
+    for (let i = 0; i < realChunks; i++) {
+      const size = base + (i < remainder ? 1 : 0)
+      const start = current
+      const end = current + size - 1
+      result.push([start, end])
+      current = end + 1
+    }
+    return result
+  }
+
+  /**
+   * Generates reelset CSV files for all game modes.
+   */
+  private generateReelsetFiles() {
+    for (const mode of Object.values(this.gameConfig.gameModes)) {
+      if (mode.reelSets && mode.reelSets.length > 0) {
+        for (const reelSet of Object.values(mode.reelSets)) {
+          reelSet.associatedGameModeName = mode.name
+          reelSet.generateReels(this.gameConfig)
+        }
+      } else {
+        throw new Error(
+          `Game mode "${mode.name}" has no reel sets defined. Cannot generate reelset files.`,
+        )
+      }
+    }
+  }
+
+  private getTimeRemaining(startTime: number, totalSims: number) {
+    const elapsedTime = Date.now() - startTime
+    const simsLeft = totalSims - completedSimulations
+    const timePerSim = elapsedTime / completedSimulations
+    const timeRemaining = Math.round((simsLeft * timePerSim) / 1000)
+    return timeRemaining
+  }
+
+  private async mergeCsv(
+    chunks: [number, number][],
+    outPath: string,
+    tempName: (i: number) => string,
+    lutIndexPath: string,
+  ) {
+    try {
+      fs.rmSync(outPath, { force: true })
+
+      const lutStream = fs.createWriteStream(outPath, {
+        highWaterMark: this.streamHighWaterMark,
+      })
+      const lutIndexStream = lutIndexPath
+        ? fs.createWriteStream(lutIndexPath, {
+            highWaterMark: this.streamHighWaterMark,
+          })
+        : undefined
+      let offset = 0n
+
+      for (let i = 0; i < chunks.length; i++) {
+        const tempLutChunk = path.join(this.PATHS.base, TEMP_FOLDER, tempName(i))
+        if (!fs.existsSync(tempLutChunk)) continue
+
+        if (lutIndexStream) {
+          // If an index file is needed, read line by line to track offsets
+          const rl = readline.createInterface({
+            input: fs.createReadStream(tempLutChunk),
+            crlfDelay: Infinity,
+          })
+
+          for await (const line of rl) {
+            if (!line.trim()) continue
+            const indexBuffer = Buffer.alloc(8)
+            indexBuffer.writeBigUInt64LE(offset)
+            if (!lutIndexStream.write(indexBuffer)) {
+              await new Promise<void>((resolve) => lutIndexStream.once("drain", resolve))
+            }
+
+            const lineWithNewline = line + "\n"
+            if (!lutStream.write(lineWithNewline)) {
+              await new Promise<void>((resolve) => lutStream.once("drain", resolve))
+            }
+            offset += BigInt(Buffer.byteLength(lineWithNewline, "utf8"))
+          }
+        } else {
+          // No index, stream normally
+          const tempChunkStream = fs.createReadStream(tempLutChunk, {
+            highWaterMark: this.streamHighWaterMark,
+          })
+          for await (const buf of tempChunkStream) {
+            if (!lutStream.write(buf)) {
+              await new Promise<void>((resolve) => lutStream.once("drain", resolve))
+            }
+          }
+        }
+
+        fs.rmSync(tempLutChunk)
+      }
+
+      lutStream.end()
+      lutIndexStream?.end()
+      await Promise.all([
+        new Promise<void>((resolve) => lutStream.on("finish", resolve)),
+        lutIndexStream
+          ? new Promise<void>((resolve) => lutIndexStream.on("finish", resolve))
+          : Promise.resolve(),
+      ])
+    } catch (error) {
+      throw new Error(`Error merging CSV files: ${(error as Error).message}`)
+    }
+  }
+
+  /**
+   * Confirms all pending tags and adds them to the main tags list.
+   */
+  confirmTags(ctx: GameContext) {
+    const tagger = ctx.services.data._getTagger()
+
+    for (const pendingTag of tagger.pendingTags) {
+      const key = Object.keys(pendingTag.properties)
+        .sort()
+        .map((k) => `${k}:${pendingTag.properties[k]}`)
+        .join("|")
+
+      let tag = tagger.tagsMap.get(key)
+      if (!tag) {
+        const search = Object.entries(pendingTag.properties)
+          .map(([name, value]) => ({ name, value }))
+          .sort((a, b) => a.name.localeCompare(b.name))
+
+        tag = {
+          search,
+          timesTriggered: 0,
+          bookIds: [],
+        }
+        tagger.tagsMap.set(key, tag)
+        tagger.tags.push(tag)
+      }
+      tag.timesTriggered++
+      if (!tag.bookIds.includes(pendingTag.bookId)) {
+        tag.bookIds.push(pendingTag.bookId)
+      }
+    }
+
+    tagger.pendingTags = []
+  }
+
+  async printSimulationSummary() {
+    Object.entries(this.summary).forEach(([mode, modeSummary]) => {
+      const modeCost = this.gameConfig.gameModes[mode]!.cost
+
+      Object.entries(modeSummary.criteria).forEach(([criteria, criteriaSummary]) => {
+        const totalWins = criteriaSummary.bsWins + criteriaSummary.fsWins
+        const rtp = totalWins / (criteriaSummary.numSims * modeCost)
+        this.summary[mode]!.criteria[criteria]!.rtp = round(rtp, 4)
+        this.summary[mode]!.criteria[criteria]!.bsWins = round(criteriaSummary.bsWins, 4)
+        this.summary[mode]!.criteria[criteria]!.fsWins = round(criteriaSummary.fsWins, 4)
+      })
+
+      const totalWins = modeSummary.total.bsWins + modeSummary.total.fsWins
+      const rtp = totalWins / (modeSummary.total.numSims * modeCost)
+      this.summary[mode]!.total.rtp = round(rtp, 4)
+      this.summary[mode]!.total.bsWins = round(modeSummary.total.bsWins, 4)
+      this.summary[mode]!.total.fsWins = round(modeSummary.total.fsWins, 4)
+    })
+
+    const maxLineLength = 50
+    let output = chalk.green.bold("\nSimulation Summary\n")
+
+    for (const [mode, modeSummary] of Object.entries(this.summary)) {
+      output += "-".repeat(maxLineLength) + "\n\n"
+      output += chalk.bold.bgWhite(`Mode: ${mode}\n`)
+      output += `Simulations: ${modeSummary.total.numSims}\n`
+      output += `Basegame Wins: ${modeSummary.total.bsWins}\n`
+      output += `Freespins Wins: ${modeSummary.total.fsWins}\n`
+      output += `RTP (unoptimized): ${modeSummary.total.rtp}\n`
+
+      output += chalk.bold("\n    Result Set Summary:\n")
+      for (const [criteria, criteriaSummary] of Object.entries(modeSummary.criteria)) {
+        output += chalk.gray("    " + "-".repeat(maxLineLength - 4)) + "\n"
+        output += chalk.bold(`    Criteria: ${criteria}\n`)
+        output += `    Simulations: ${criteriaSummary.numSims}\n`
+        output += `    Basegame Wins: ${criteriaSummary.bsWins}\n`
+        output += `    Freespins Wins: ${criteriaSummary.fsWins}\n`
+        output += `    RTP (unoptimized): ${criteriaSummary.rtp}\n`
+      }
+    }
+
+    console.log(output)
+
+    writeFile(this.PATHS.simulationSummary, JSON.stringify(this.summary, null, 2))
+
+    if (this.socket && this.panelActive) {
+      this.socket.emit("simulationSummary", {
+        summary: this.summary,
+      })
+    }
+  }
+
+  private sendSimulationStatus(message: string) {
+    if (this.socket && this.panelActive) {
+      this.socket.emit("simulationStatus", message)
+    }
+  }
+}
+
+export type SimulationOptions = {
+  /**
+   * Object containing the game modes and their respective simulation runs amount.
+   */
+  simRunsAmount: Record<string, number>
+  /**
+   * Number of concurrent processes to use for simulations.
+   *
+   * Default: 6
+   */
+  concurrency?: number
+  /**
+   * The maximum number of simulation results to keep pending in memory before writing to disk.
+   *
+   * Higher values may speed up simulations but use more RAM.
+   *
+   * Default: 250
+   */
+  maxPendingSims?: number
+  /**
+   * The maximum data buffer in MB for writing simulation results to disk.
+   *
+   * Higher values may speed up simulations but use more RAM.
+   *
+   * Default: 50
+   */
+  maxDiskBuffer?: number
+  /**
+   * Whether to generate uncompressed book files alongside compressed ones.
+   */
+  makeUncompressedBooks?: boolean
+}
+
+export type SimulationConfigOptions = {
+  debug?: boolean
+  panelPort?: number
+}
+
+export type SimulationSummary = Record<
+  string,
+  {
+    total: {
+      numSims: number
+      bsWins: number
+      fsWins: number
+      rtp: number
+    }
+    criteria: Record<
+      string,
+      {
+        numSims: number
+        bsWins: number
+        fsWins: number
+        rtp: number
+      }
+    >
+  }
+>

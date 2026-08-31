@@ -1,0 +1,52 @@
+@import "tailwindcss";
+@import "fumadocs-ui/css/vitepress.css";
+@import "fumadocs-ui/css/preset.css";
+
+html, body {
+  scroll-behavior: smooth;
+}
+
+strong {
+  text-decoration: underline;
+  text-decoration-color: var(--color-fd-primary);
+  text-decoration-thickness: 2px;
+}
+
+p a {
+  color: var(--color-fd-primary);
+  text-decoration-color: var(--color-fd-primary);
+  text-decoration-thickness: 2px;
+}
+
+ul li::marker {
+  color: var(--color-fd-primary);
+}
+
+/* Homepage decorative grid */
+.se-grid {
+  background-size: 46px 46px;
+  background-image:
+    linear-gradient(
+      to right,
+      color-mix(in srgb, var(--color-fd-border) 70%, transparent) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--color-fd-border) 70%, transparent) 1px,
+      transparent 1px
+    );
+}
+
+.se-grid-mask {
+  -webkit-mask-image: radial-gradient(
+    ellipse 80% 55% at 50% 0%,
+    #000 30%,
+    transparent 75%
+  );
+  mask-image: radial-gradient(
+    ellipse 80% 55% at 50% 0%,
+    #000 30%,
+    transparent 75%
+  );
+}

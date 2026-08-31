@@ -1,0 +1,17 @@
+name: 'CI checks'
+description: 'Run CI checks like linting, typechecking, tests, etc.'
+runs:
+  using: 'composite'
+  steps:
+    - name: Build
+      run: pnpm build
+      shell: bash
+
+    # Causes problems with Panel, disable for now
+    #- name: Typecheck
+    #  run: pnpm typecheck
+    #  shell: bash
+
+    - name: Test
+      run: pnpm test
+      shell: bash

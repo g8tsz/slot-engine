@@ -1,0 +1,95 @@
+import { SPIN_TYPE } from "./constants"
+import { GameContext } from "./game-context"
+import { GameMode } from "./game-mode"
+import { GameSymbol } from "./game-symbol"
+import { SlotGame } from "./slot-game"
+import type { GameMetadata } from "./game-config"
+import type { PermanentFilePaths } from "./utils/file-paths"
+
+export type InferGameType<
+  TGameModes extends AnyGameModes,
+  TSymbols extends AnySymbols,
+  TUserState extends AnyUserData,
+> = SlotGame<TGameModes, TSymbols, TUserState>
+
+/**
+ * @internal
+ */
+export type AnyUserData = Record<string, any>
+
+/**
+ * @internal
+ */
+export type AnyGameModes = Record<string, GameMode>
+
+/**
+ * @internal
+ */
+export type AnySymbols = Record<string, GameSymbol>
+
+/**
+ * @internal
+ */
+export interface GameHooks<
+  TGameModes extends AnyGameModes = AnyGameModes,
+  TSymbols extends AnySymbols = AnySymbols,
+  TUserState extends AnyUserData = AnyUserData,
+> {
+  /**
+   * This hook is called after the simulation state is prepared for a spin,\
+   * and the core is ready to handle the game flow.
+   *
+   * **The developer is responsible for implementing the entire game flow here, including:**
+   * - Drawing the board
+   * - Evaluating wins
+   * - Tumbling mechanics
+   * - Updating wallet
+   * - Handling free spins
+   * - Tagging events
+   * - ... and everything in between.
+   *
+   * You can access the config and state from the context.
+   *
+   * The game flow is not built into the core, because it can vary greatly between different games.\
+   * This hook provides the flexibility to implement any game flow you need.
+   */
+  onHandleGameFlow: (ctx: GameContext<TGameModes, TSymbols, TUserState>) => void
+  /**
+   * This hook is called whenever a simulation is accepted, i.e. when the criteria of the current ResultSet is met.
+   */
+  onSimulationAccepted?: (ctx: GameContext<TGameModes, TSymbols, TUserState>) => void
+  /**
+   * This hook is called after a game mode has been fully simulated and all of its
+   * files have been written. It only runs on the main thread, and is awaited.
+   *
+   * It exposes the game metadata, including all file paths of the build directory.\
+   * A common use case is optimizing the lookup table of the completed game mode,
+   * e.g. by feeding the paths into the `optimize()` function of `@slot-engine/optimizer`.
+   */
+  onGameModeComplete?: (info: GameModeCompleteInfo) => void | Promise<void>
+}
+
+/**
+ * Info passed to the `onGameModeComplete` hook.
+ */
+export interface GameModeCompleteInfo {
+  /**
+   * The name of the game mode that completed.
+   */
+  mode: string
+  /**
+   * All file paths of the build directory, e.g. the lookup tables of the completed game mode.
+   */
+  paths: PermanentFilePaths
+  /**
+   * The game metadata.
+   */
+  metadata: GameMetadata
+}
+
+export type SpinType = (typeof SPIN_TYPE)[keyof typeof SPIN_TYPE]
+
+export type Reels = GameSymbol[][]
+
+export type LookupTable = [number, number, number][]
+export type LookupTableSegmented = [number, string, number, number][]

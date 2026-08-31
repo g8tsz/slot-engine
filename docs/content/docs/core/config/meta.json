@@ -1,0 +1,12 @@
+{
+  "title": "Configuration Options",
+  "icon": "Settings",
+  "pages": [
+    "symbols",
+    "game-modes",
+    "reel-sets",
+    "result-sets",
+    "hooks",
+    "custom-state"
+  ]
+}

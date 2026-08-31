@@ -1,0 +1,183 @@
+export class RandomNumberGenerator {
+  mIdum: number
+  mIy: number
+  mIv: Array<number>
+  NTAB: number
+  IA: number
+  IM: number
+  IQ: number
+  IR: number
+  NDIV: number
+  AM: number
+  RNMX: number
+
+  protected _currentSeed: number = 0
+
+  constructor() {
+    this.mIdum = 0
+    this.mIy = 0
+    this.mIv = []
+
+    this.NTAB = 32
+    this.IA = 16807
+    this.IM = 2147483647
+    this.IQ = 127773
+    this.IR = 2836
+    this.NDIV = 1 + (this.IM - 1) / this.NTAB
+    this.AM = 1.0 / this.IM
+    this.RNMX = 1.0 - 1.2e-7
+  }
+
+  getCurrentSeed() {
+    return this._currentSeed
+  }
+
+  protected setCurrentSeed(seed: number) {
+    this._currentSeed = seed
+  }
+
+  setSeed(seed: number): void {
+    this.mIdum = seed
+    this.setCurrentSeed(seed)
+
+    if (seed >= 0) {
+      this.mIdum = -seed
+    }
+
+    this.mIy = 0
+  }
+
+  setSeedIfDifferent(seed: number) {
+    if (this.getCurrentSeed() !== seed) {
+      this.setSeed(seed)
+    }
+  }
+
+  /**
+   * Captures the full internal state of the RNG.
+   *
+   * Intended for internal use only.
+   */
+  getStateSnapshot(): RngStateSnapshot {
+    return {
+      mIdum: this.mIdum,
+      mIy: this.mIy,
+      mIv: this.mIv.slice(),
+      currentSeed: this._currentSeed,
+    }
+  }
+
+  /**
+   * Restores the RNG to a previously captured state.
+   *
+   * Intended for internal use only.
+   */
+  restoreStateSnapshot(snapshot: RngStateSnapshot) {
+    this.mIdum = snapshot.mIdum
+    this.mIy = snapshot.mIy
+    this.mIv = snapshot.mIv.slice()
+    this._currentSeed = snapshot.currentSeed
+  }
+
+  generateRandomNumber(): number {
+    let k: number
+    let j: number
+
+    if (this.mIdum <= 0 || this.mIy === 0) {
+      if (-this.mIdum < 1) {
+        this.mIdum = 1
+      } else {
+        this.mIdum = -this.mIdum
+      }
+
+      for (j = this.NTAB + 7; j >= 0; j -= 1) {
+        k = Math.floor(this.mIdum / this.IQ)
+        this.mIdum = Math.floor(this.IA * (this.mIdum - k * this.IQ) - this.IR * k)
+
+        if (this.mIdum < 0) {
+          this.mIdum += this.IM
+        }
+
+        if (j < this.NTAB) {
+          this.mIv[j] = this.mIdum
+        }
+      }
+
+      ;[this.mIy as any] = this.mIv
+    }
+
+    k = Math.floor(this.mIdum / this.IQ)
+    this.mIdum = Math.floor(this.IA * (this.mIdum - k * this.IQ) - this.IR * k)
+
+    if (this.mIdum < 0) {
+      this.mIdum += this.IM
+    }
+
+    j = Math.floor(this.mIy / this.NDIV)
+
+    this.mIy = Math.floor(this.mIv[j] as any)
+    this.mIv[j] = this.mIdum
+
+    return this.mIy
+  }
+
+  randomFloat(low: number, high: number): number {
+    let float: number = this.AM * this.generateRandomNumber()
+
+    if (float > this.RNMX) {
+      float = this.RNMX
+    }
+
+    return float * (high - low) + low
+  }
+
+  weightedRandom<T extends Record<string, number>>(weights: T) {
+    let totalWeight = 0
+    for (const key in weights) {
+      totalWeight += weights[key]!
+    }
+
+    let remaining = this.randomFloat(0, 1) * totalWeight
+
+    for (const key in weights) {
+      remaining -= weights[key]!
+      if (remaining < 0) {
+        return key
+      }
+    }
+
+    throw new Error("No item selected in weighted random selection.")
+  }
+
+  randomItem<T>(array: T[]) {
+    if (array.length === 0) {
+      throw new Error("Cannot select a random item from an empty array.")
+    }
+    const randomIndex = Math.floor(this.randomFloat(0, 1) * array.length)
+    return array[randomIndex]!
+  }
+
+  shuffle<T>(array: T[]): T[] {
+    const newArray = [...array]
+    let currentIndex = newArray.length,
+      randomIndex
+
+    while (currentIndex != 0) {
+      randomIndex = Math.floor(this.randomFloat(0, 1) * currentIndex)
+      currentIndex--
+      ;[newArray[currentIndex] as any, newArray[randomIndex] as any] = [
+        newArray[randomIndex],
+        newArray[currentIndex],
+      ]
+    }
+
+    return newArray
+  }
+}
+
+export interface RngStateSnapshot {
+  mIdum: number
+  mIy: number
+  mIv: number[]
+  currentSeed: number
+}

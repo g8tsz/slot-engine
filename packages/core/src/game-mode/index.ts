@@ -1,0 +1,107 @@
+import assert from "assert"
+import { ResultSet } from "../result-set"
+import { ReelSet } from "../reel-set"
+
+export class GameMode {
+  readonly name: string
+  private readonly _reelsAmount: number
+  private readonly _symbolsPerReel: number[]
+  reelsAmount: number
+  symbolsPerReel: number[]
+  readonly cost: number
+  readonly rtp: number
+  readonly reelSets: ReelSet[]
+  readonly resultSets: ResultSet<any>[]
+  readonly isBonusBuy: boolean
+
+  constructor(opts: GameModeOpts) {
+    this.name = opts.name
+    this._reelsAmount = opts.reelsAmount
+    this.reelsAmount = opts.reelsAmount
+    this._symbolsPerReel = opts.symbolsPerReel
+    this.symbolsPerReel = opts.symbolsPerReel
+    this.cost = opts.cost
+    this.rtp = opts.rtp
+    this.reelSets = opts.reelSets
+    this.resultSets = opts.resultSets
+    this.isBonusBuy = opts.isBonusBuy
+
+    assert(this.rtp >= 0.9 && this.rtp <= 0.99, "RTP must be between 0.9 and 0.99")
+
+    assert(
+      this.symbolsPerReel.length === this.reelsAmount,
+      "symbolsPerReel length must match reelsAmount.",
+    )
+
+    assert(this.reelSets.length > 0, "GameMode must have at least one ReelSet defined.")
+  }
+
+  /**
+   * Intended for internal use only.
+   */
+  _resetTempValues() {
+    this.reelsAmount = this._reelsAmount
+    this.symbolsPerReel = this._symbolsPerReel
+  }
+
+  /**
+   * Intended for internal use only.
+   */
+  _setSymbolsPerReel(symbolsPerReel: number[]) {
+    assert(
+      symbolsPerReel.length === this._reelsAmount,
+      "symbolsPerReel length must match reelsAmount.",
+    )
+    this.symbolsPerReel = symbolsPerReel
+  }
+
+  /**
+   * Intended for internal use only.
+   */
+  _setReelsAmount(reelsAmount: number) {
+    this.reelsAmount = reelsAmount
+  }
+}
+
+export interface GameModeOpts {
+  /**
+   * Name of the game mode.
+   */
+  name: string
+  /**
+   * Number of reels the board has.
+   */
+  reelsAmount: number
+  /**
+   * How many symbols each reel has. Array length must match `reelsAmount`.\
+   * The number at an array index represents the number of symbols on that reel.
+   */
+  symbolsPerReel: number[]
+  /**
+   * Cost of the game mode, multiplied by the base bet.
+   */
+  cost: number
+  /**
+   * The target RTP of the game.
+   */
+  rtp: number
+  /**
+   * Defines (and generates) all reels for the game.\
+   * Which reels are used in a spin is determined by the ResultSet of the current game mode.
+   *
+   * It is common to have one reel set for the base game and another for free spins.\
+   * Each `ResultSet` can then set the weights of these reel sets to control which\
+   * reel set is used for a specific criteria.
+   */
+  reelSets: ReelSet[]
+  /**
+   * A ResultSet defines how often a specific outcome should be generated.\
+   * For example, a ResultSet can be used to force a specific ratio of max wins\
+   * in the simulations to ensure there are different frontend representations.
+   */
+  resultSets: ResultSet<any>[]
+  /**
+   * Whether this game mode is a bonus buy.
+   */
+  isBonusBuy: boolean
+}

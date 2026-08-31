@@ -1,0 +1,117 @@
+---
+title: Overview
+description: Learn the key components to defining your game.
+icon: BookOpenText
+---
+
+---
+
+## Setting up your game
+
+Create a game by calling `createSlotGame()` and passing a configuration object.
+Begin by defining basic game details, then explore the comprehensive [configuration options](#options) detailed below.
+
+```ts lineNumbers
+import { createSlotGame, SPIN_TYPE } from "@slot-engine/core"
+
+export const game = createSlotGame({
+  id: "my-game",
+  name: "My Game",
+  maxWinX: 5000,
+  padSymbols: 1,
+  scatterToFreespins: {
+    [SPIN_TYPE.BASE_GAME]: {
+      3: 10,
+      4: 12,
+      5: 15,
+    },
+    [SPIN_TYPE.FREE_SPINS]: {
+      3: 6,
+      4: 8,
+      5: 10,
+    },
+  },
+  symbols: {},
+  gameModes: {},
+  userState: {},
+  hooks: {
+    onHandleGameFlow(ctx) {},
+  },
+})
+```
+
+When using TypeScript, you will encounter a type error.
+This is expected because `createSlotGame` requires a type argument. Let's create a type for your game.
+
+```ts lineNumbers
+import { createSlotGame, SPIN_TYPE } from "@slot-engine/core" // [!code --]
+import { createSlotGame, SPIN_TYPE, InferGameType } from "@slot-engine/core" // [!code ++]
+
+export type GameType = InferGameType<any, any, any> // [!code ++]
+
+export const game = createSlotGame({}) // [!code --]
+export const game = createSlotGame<GameType>({}) // [!code ++]
+```
+
+The utility type `InferGameType` requires three type arguments: game modes, symbols, and state.
+Since we haven't configured these yet, you can use `any` for now.
+
+You can now prepare the rest of the configuration.
+
+```ts lineNumbers
+import { createSlotGame, GameConfig, InferGameType } from "@slot-engine/core" // [!code --]
+import {
+  createSlotGame, // [!code ++]
+  SPIN_TYPE, // [!code ++]
+  InferGameType, // [!code ++]
+  defineGameModes, // [!code ++]
+  defineSymbols, // [!code ++]
+  defineUserState, // [!code ++]
+} from "@slot-engine/core" // [!code ++]
+
+export const gameModes = defineGameModes({}) // [!code ++]
+export type GameModesType = typeof gameModes // [!code ++]
+
+export const symbols = defineSymbols({}) // [!code ++]
+export type SymbolsType = typeof symbols // [!code ++]
+
+export const userState = defineUserState({}) // [!code ++]
+export type UserStateType = typeof userState // [!code ++]
+
+export type GameType = InferGameType<any, any, any> // [!code --]
+export type GameType = InferGameType<GameModesType, SymbolsType, UserStateType> // [!code ++]
+
+export const game = createSlotGame<GameType>({
+  /* the rest of your configuration */
+  symbols: {}, // [!code --]
+  gameModes: {}, // [!code --]
+  userState: {}, // [!code --]
+  symbols, // [!code ++]
+  gameModes, // [!code ++]
+  userState, // [!code ++]
+})
+```
+
+You have now completed the basic game setup.
+Continue by configuring [symbols](/docs/core/config/symbols),
+[game modes](/docs/core/config/game-modes),and [state](/docs/core/config/custom-state).
+
+At the heart of your game lies the actual [implementation](/docs/core/game-implementation).
+
+Finally, [simulate](/docs/core/game-tasks/simulation) your game, tweak settings to improve the feel of it,
+and [optimize](/docs/core/game-tasks/optimization) results to achieve your desired RTP.
+
+## createSlotGame() Options [#options]
+
+| Property             | Type                                     | Description                                                                                                                                                                                                                             | Required |
+| -------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| `id`                 | `string`                                 | A unique identifier for your game.                                                                                                                                                                                                      | yes      |
+| `name`               | `string`                                 | The name of your game.                                                                                                                                                                                                                  | yes      |
+| `maxWinX`            | `number`                                 | The maximum bet multiplier payout. Wins exceeding this number will be capped.                                                                                                                                                           | yes      |
+| `gameModes`          | `Record<string, GameMode>`               | See: [Game Configuration: Game Modes](/docs/core/config/game-modes)                                                                                                                                                                     | yes      |
+| `symbols`            | `Record<string, GameSymbol>`             | See: [Game Configuration: Symbols](/docs/core/config/symbols)                                                                                                                                                                           | yes      |
+| `padSymbols`         | `number`                                 | Amount of padding symbol rows above and below the active board.<br/>Used to display partially visible symbols in the frontend at the top and bottom of the board.<br/><br/>Defaults to 1                                                | yes      |
+| `scatterToFreespins` | `Record<string, Record<number, number>>` | A mapping from spin type to scatter counts to the number of free spins awarded.                                                                                                                                                         | yes      |
+| `userState`          | `Record<string, any>`                    | See: [Game Configuration: User State](/docs/core/config/custom-state)                                                                                                                                                                   | yes      |
+| `hooks`              | `Record<string, (ctx) => unknown>`       | See: [Game Configuration: Hooks](/docs/core/config/hooks)                                                                                                                                                                               | yes      |
+| `rootDir`            | `string`                                 | Normally you would `cd` into the game directory and run it from there. If you run your game from a different file or `process.cwd()` is not where your game lies, specify this option and provide a path. `__dirname` should work fine. |

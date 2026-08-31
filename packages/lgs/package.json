@@ -1,0 +1,29 @@
+{
+  "name": "@slot-engine/lgs",
+  "version": "0.0.0",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/slot-engine/slot-engine"
+  },
+  "homepage": "https://slot-engine.dev/docs/lgs",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsup ./index.ts --dts --format cjs,esm --sourcemap",
+    "dev": "tsup ./index.ts --dts --format cjs,esm --sourcemap --watch"
+  },
+  "files": [
+    "dist"
+  ],
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts",
+      "module": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  }
+}

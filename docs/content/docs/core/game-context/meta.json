@@ -1,0 +1,13 @@
+{
+  "title": "Game Context",
+  "icon": "Group",
+  "pages": [
+    "config",
+    "game-service",
+    "data-service",
+    "board-service",
+    "wallet-service",
+    "rng-service",
+    "state"
+  ]
+}
